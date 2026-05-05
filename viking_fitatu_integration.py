@@ -265,31 +265,34 @@ def create_or_find_product(menu_meal_name: str, nutrition: dict, weight: str, ta
     return product_id
 
 
-def process_meal(delivery: dict, target_date: str) -> tuple[str, str]:
-    """Processes a single meal and returns its product ID and weight."""
+def process_meal(delivery: dict, target_date: str) -> list[dict]:
+    """Processes a single delivery and returns meals to sync."""
     delivery_id = delivery["deliveryId"]
     viking_date_data = fetch_viking_meal_details(delivery_id)
     if not viking_date_data:
         logging.error(f"Failed to retrieve delivery details for {delivery_id}")
-        return None, None
+        return []
 
-    meal_ids, meal_weights = {}, {}
+    meals = []
     for meal in viking_date_data.get("deliveryMenuMeal", []):
         if meal.get("deliveryMealId") is None:
-            logging.info(f"Skipping '{meal.get("mealName", "")}' - there is no develivery")
+            logging.info(f"Skipping '{meal.get('mealName', '')}' - there is no develivery")
             continue
 
         menu_meal_name = meal.get("menuMealName")
-        if (menu_meal_name):
+        if menu_meal_name:
             meal_name = meal.get("mealName", "")
             nutrition = meal.get("nutrition", {})
             weight = nutrition.get("weight", "N/A")
 
             product_id = create_or_find_product(menu_meal_name, nutrition, weight, target_date)
             if product_id:
-                meal_ids[meal_name] = product_id
-                meal_weights[meal_name] = weight
-    return meal_ids, meal_weights
+                meals.append({
+                    "meal_name": meal_name,
+                    "meal_id": product_id,
+                    "meal_weight": weight
+                })
+    return meals
 
 
 def process_date(target_date: str, data: dict) -> dict:
@@ -298,28 +301,22 @@ def process_date(target_date: str, data: dict) -> dict:
 
     if not deliveries_on_date:
         logging.info(f"No meals found for {target_date}")
-        return {"meal_ids": {}, "meal_weights": {}}
+        return {"meals": []}
 
-    all_meal_ids, all_meal_weights = {}, {}
+    all_meals = []
     for delivery in deliveries_on_date:
-        meal_ids, meal_weights = process_meal(delivery, target_date)
-        if meal_ids:
-            all_meal_ids.update(meal_ids)
-            all_meal_weights.update(meal_weights)
+        meals = process_meal(delivery, target_date)
+        if meals:
+            all_meals.extend(meals)
 
-    return {"meal_ids": all_meal_ids, "meal_weights": all_meal_weights}
+    return {"meals": all_meals}
 
 
-def add_meal_to_diet_plan(diet_plan: dict, meal_name: str, meal_id: str, meal_weight: int, existing_plan: dict):
-    """Adds a meal to the diet plan while avoiding duplicates."""
+def add_meal_to_diet_plan(diet_plan: dict, meal_name: str, meal_id: str, meal_weight: int):
+    """Adds a meal to the diet plan."""
     mapped_key = MEAL_MAPPING.get(meal_name)
     if not mapped_key:
         logging.info(f"Skipping '{meal_name}' - not supported meal by mapping configuration")
-        return
-
-    # Check if this exact product ID already exists
-    if meal_id and mapped_key in existing_plan and any(item.get("productId") == meal_id for item in existing_plan[mapped_key]):
-        logging.info(f"Skipping '{meal_name}' - already exists in diet plan with same product")
         return
 
     diet_plan.setdefault(mapped_key, {"items": []})["items"].append({
@@ -334,27 +331,69 @@ def add_meal_to_diet_plan(diet_plan: dict, meal_name: str, meal_id: str, meal_we
     logging.info(f"Added '{meal_name}' to diet plan ({meal_weight}g, product ID: {meal_id})")
 
 
-def publish_diet_plan(date: str, meal_ids: dict, meal_weights: dict):
+def publish_diet_plan(date: str, meals: list[dict]):
     """Publishes the diet plan to Fitatu."""
     existing_plan = get_existing_diet_plan(date)
     diet_plan = {date: {"dietPlan": {}}}
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    aggregated_meals = {}
 
-    # Mark meals with outdated product IDs for deletion (only if new product ID differs)
+    for meal in meals:
+        mapped_key = MEAL_MAPPING.get(meal["meal_name"])
+        if not mapped_key:
+            logging.info(f"Skipping '{meal['meal_name']}' - not supported meal by mapping configuration")
+            continue
+
+        if not meal["meal_id"]:
+            continue
+
+        aggregate_key = (mapped_key, meal["meal_id"])
+        if aggregate_key not in aggregated_meals:
+            aggregated_meals[aggregate_key] = {
+                "meal_name": meal["meal_name"],
+                "meal_id": meal["meal_id"],
+                "meal_weight": 0
+            }
+
+        aggregated_meals[aggregate_key]["meal_weight"] += int(meal["meal_weight"])
+
+    handled_meals = set()
+
+    # Keep a single active item per product and meal slot, with total weight aggregated.
     for meal_key, items in existing_plan.items():
         items_to_keep = []
+        items_by_product = {}
+
         for item in items:
-            # Only mark for deletion if this product is from Viking brand but not in current meal IDs
-            if item["productId"] not in meal_ids.values():
-                item["deletedAt"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            items_to_keep.append(item)
+            items_by_product.setdefault(item.get("productId"), []).append(item)
+
+        for product_id, grouped_items in items_by_product.items():
+            aggregate_key = (meal_key, product_id)
+            desired_meal = aggregated_meals.get(aggregate_key)
+            first_item = grouped_items[0]
+
+            if desired_meal:
+                first_item["measureQuantity"] = desired_meal["meal_weight"]
+                first_item["updatedAt"] = timestamp
+                first_item.pop("deletedAt", None)
+                handled_meals.add(aggregate_key)
+            else:
+                first_item["deletedAt"] = timestamp
+            items_to_keep.append(first_item)
+
+            for extra_item in grouped_items[1:]:
+                extra_item["deletedAt"] = timestamp
+                items_to_keep.append(extra_item)
         
         # Keep all items (both marked for deletion and existing ones)
         if items_to_keep:
             diet_plan[date]["dietPlan"][meal_key] = {"items": items_to_keep}  
 
-    # Add new meals (will skip if same product ID already exists)
-    for meal_name, meal_id in meal_ids.items():
-        add_meal_to_diet_plan(diet_plan[date]["dietPlan"], meal_name, meal_id, meal_weights.get(meal_name, 100), existing_plan)
+    for aggregate_key, meal in aggregated_meals.items():
+        if aggregate_key in handled_meals:
+            continue
+
+        add_meal_to_diet_plan(diet_plan[date]["dietPlan"], meal["meal_name"], meal["meal_id"], meal["meal_weight"])
 
     if FitatuClient.post(APIConfig.FITATU_DIET_PLAN_URL, diet_plan):
         logging.info(f"Fitatu Diet Plan updated for {date}")
@@ -373,7 +412,7 @@ def main():
         logging.info(f"Processing {target_date}")
         result = process_date(target_date, order_data)
 
-        publish_diet_plan(target_date, result["meal_ids"], result["meal_weights"])
+        publish_diet_plan(target_date, result["meals"])
 
 
 if __name__ == "__main__":
